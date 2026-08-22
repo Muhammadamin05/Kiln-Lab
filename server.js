@@ -90,3 +90,15 @@ app.get("/api/orders", requireAuth(), (req, res) => {
   if (req.user.role === "clinic") {
     rows = db.prepare(`${ORDER_SELECT} WHERE orders.clinic_id = ? ORDER BY due_date ASC`).all(req.user.clinicId);
   } else {
+app.get("/api/orders/:id/history", requireAuth(), (req, res) => {
+  const { id } = req.params;
+  const events = db.prepare("SELECT stage_index, changed_at FROM stage_events WHERE order_id = ? ORDER BY changed_at ASC").all(id);
+  res.json(events.map((e) => ({ stage: STAGES[e.stage_index], changedAt: e.changed_at })));
+});
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, () => {
+  console.log(`Dental lab tracker API running on http://localhost:${PORT}`);
+});
+
+  
