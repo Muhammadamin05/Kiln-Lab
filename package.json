@@ -1,0 +1,16 @@
+{
+  "name": "dental-lab-tracker-backend",
+  "version": "1.0.0",
+  "description": "Backend for the dental lab order tracker (clinic <-> lab)",
+  "main": "server.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "better-sqlite3": "^11.3.0",
+    "cors": "^2.8.5"
+  }
+}
