@@ -40,6 +40,25 @@ CREATE TABLE IF NOT EXISTS users (
 );
 `);
 
+// ---- Migrations: add columns if they don't exist yet (safe to re-run) ----
+function ensureColumn(table, column, definition) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  const exists = cols.some((c) => c.name === column);
+  if (!exists) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+ensureColumn("orders", "doctor", "TEXT");
+ensureColumn("orders", "tooth_count", "INTEGER");
+ensureColumn("orders", "tooth_positions", "TEXT");
+ensureColumn("orders", "modeling_technician", "TEXT");
+ensureColumn("orders", "modeling_quantity", "INTEGER");
+ensureColumn("orders", "modeling_due_date", "TEXT");
+ensureColumn("orders", "ceramist_technician", "TEXT");
+ensureColumn("orders", "ceramist_quantity", "INTEGER");
+ensureColumn("orders", "ceramist_due_date", "TEXT");
+
 const clinicCount = db.prepare("SELECT COUNT(*) AS n FROM clinics").get().n;
 if (clinicCount === 0) {
   const insertClinic = db.prepare("INSERT INTO clinics (name) VALUES (?)");
