@@ -14,12 +14,15 @@ function serializeOrder(row) {
     id: row.id,
     patient: row.patient,
     clinic: row.clinic_name,
+    clinicId: row.clinic_id,
     doctor: row.doctor,
     toothCount: row.tooth_count,
     toothPositions: row.tooth_positions,
     workType: row.work_type,
     shade: row.shade,
     dueDate: row.due_date,
+    trayInfo: row.tray_info,
+    fittingDates: [row.fitting_date_1, row.fitting_date_2, row.fitting_date_3],
     stageIndex: row.stage_index,
     stage: STAGES[row.stage_index],
     modeling: {
@@ -45,7 +48,6 @@ const ORDER_SELECT = `
 
 // ---------- Auth ----------
 
-// Public self-registration for a new clinic account.
 app.post("/api/auth/register", (req, res) => {
   const { clinicName, password } = req.body;
   if (!clinicName || !clinicName.trim()) return res.status(400).json({ error: "укажите название клиники" });
@@ -82,12 +84,7 @@ app.post("/api/auth/login", (req, res) => {
   if (!valid) return res.status(401).json({ error: "неверное имя или пароль" });
 
   const token = signToken(user);
-  res.json({
-    token,
-    role: user.role,
-    name: user.name,
-    clinicId: user.clinic_id,
-  });
+  res.json({ token, role: user.role, name: user.name, clinicId: user.clinic_id });
 });
 
 app.post("/api/auth/change-password", requireAuth(), (req, res) => {
@@ -102,9 +99,54 @@ app.post("/api/auth/change-password", requireAuth(), (req, res) => {
 
 // ---------- Clinics ----------
 
+// Full clinic list with doctor + order counts. Useful for the lab's management screen.
 app.get("/api/clinics", requireAuth(), (req, res) => {
-  const clinics = db.prepare("SELECT id, name FROM clinics ORDER BY name").all();
-  res.json(clinics);
+  const clinics = db.prepare(`
+    SELECT clinics.*,
+      (SELECT COUNT(*) FROM doctors WHERE doctors.clinic_id = clinics.id) AS doctor_count,
+      (SELECT COUNT(*) FROM orders WHERE orders.clinic_id = clinics.id) AS order_count
+    FROM clinics ORDER BY name
+  `).all();
+  res.json(clinics.map((c) => ({ id: c.id, name: c.name, doctorCount: c.doctor_count, orderCount: c.order_count })));
+});
+
+// Lab can add a clinic to the roster ahead of it registering its own login.
+app.post("/api/clinics", requireAuth("lab"), (req, res) => {
+  const { name } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: "name is required" });
+  try {
+    const info = db.prepare("INSERT INTO clinics (name) VALUES (?)").run(name.trim());
+    res.status(201).json({ id: info.lastInsertRowid, name: name.trim(), doctorCount: 0, orderCount: 0 });
+  } catch (err) {
+    res.status(409).json({ error: "клиника с таким именем уже есть" });
+  }
+});
+
+// ---------- Doctors ----------
+
+// List doctors. Clinic sees only its own; lab can filter by clinicId or see all.
+app.get("/api/doctors", requireAuth(), (req, res) => {
+  let rows;
+  if (req.user.role === "clinic") {
+    rows = db.prepare("SELECT * FROM doctors WHERE clinic_id = ? ORDER BY name").all(req.user.clinicId);
+  } else if (req.query.clinicId) {
+    rows = db.prepare("SELECT * FROM doctors WHERE clinic_id = ? ORDER BY name").all(req.query.clinicId);
+  } else {
+    rows = db.prepare("SELECT * FROM doctors ORDER BY name").all();
+  }
+  res.json(rows.map((d) => ({ id: d.id, name: d.name, clinicId: d.clinic_id })));
+});
+
+// A clinic adds its own doctor; the lab can add a doctor to any clinic (needs clinicId).
+app.post("/api/doctors", requireAuth(), (req, res) => {
+  const { name, clinicId } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: "name is required" });
+
+  const targetClinicId = req.user.role === "clinic" ? req.user.clinicId : clinicId;
+  if (!targetClinicId) return res.status(400).json({ error: "clinicId is required" });
+
+  const info = db.prepare("INSERT INTO doctors (clinic_id, name) VALUES (?, ?)").run(targetClinicId, name.trim());
+  res.status(201).json({ id: info.lastInsertRowid, name: name.trim(), clinicId: targetClinicId });
 });
 
 // ---------- Orders ----------
@@ -119,17 +161,24 @@ app.get("/api/orders", requireAuth(), (req, res) => {
   res.json(rows.map(serializeOrder));
 });
 
-// Create a new order. Only a clinic can do this, and only for itself.
 app.post("/api/orders", requireAuth("clinic"), (req, res) => {
-  const { patient, doctor, toothCount, toothPositions, workType, shade, dueDate } = req.body;
+  const {
+    patient, doctor, toothCount, toothPositions, workType, shade, dueDate,
+    trayInfo, fittingDates,
+  } = req.body;
 
   if (!patient || !patient.trim()) return res.status(400).json({ error: "patient is required" });
   if (!workType || !workType.trim()) return res.status(400).json({ error: "workType is required" });
   if (!dueDate) return res.status(400).json({ error: "dueDate is required" });
 
+  const fd = Array.isArray(fittingDates) ? fittingDates : [];
+
   const info = db.prepare(`
-    INSERT INTO orders (patient, clinic_id, doctor, tooth_count, tooth_positions, work_type, shade, due_date, stage_index)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+    INSERT INTO orders (
+      patient, clinic_id, doctor, tooth_count, tooth_positions, work_type, shade, due_date,
+      tray_info, fitting_date_1, fitting_date_2, fitting_date_3, stage_index
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
   `).run(
     patient.trim(),
     req.user.clinicId,
@@ -138,7 +187,11 @@ app.post("/api/orders", requireAuth("clinic"), (req, res) => {
     toothPositions ? toothPositions.trim() : null,
     workType.trim(),
     shade || null,
-    dueDate
+    dueDate,
+    trayInfo ? trayInfo.trim() : null,
+    fd[0] || null,
+    fd[1] || null,
+    fd[2] || null
   );
 
   db.prepare("INSERT INTO stage_events (order_id, stage_index) VALUES (?, 0)").run(info.lastInsertRowid);
@@ -147,7 +200,6 @@ app.post("/api/orders", requireAuth("clinic"), (req, res) => {
   res.status(201).json(serializeOrder(row));
 });
 
-// Advance an order to the next stage. Only lab staff can do this.
 app.patch("/api/orders/:id/advance", requireAuth("lab"), (req, res) => {
   const { id } = req.params;
   const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
@@ -165,8 +217,6 @@ app.patch("/api/orders/:id/advance", requireAuth("lab"), (req, res) => {
   res.json(serializeOrder(row));
 });
 
-// Assign who's doing the modeling or ceramics work, how many units, and by when.
-// Only lab staff can do this. taskType is "modeling" or "ceramist".
 app.patch("/api/orders/:id/assign", requireAuth("lab"), (req, res) => {
   const { id } = req.params;
   const { taskType, technician, quantity, dueDate } = req.body;
