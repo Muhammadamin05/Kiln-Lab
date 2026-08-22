@@ -30,6 +30,9 @@ const ORDER_SELECT = `
   JOIN clinics ON clinics.id = orders.clinic_id
 `;
 
+// ---------- Auth ----------
+
+// Login for both lab staff and clinics. Send { name, password }.
 app.post("/api/auth/login", (req, res) => {
   const { name, password } = req.body;
   if (!name || !password) return res.status(400).json({ error: "name and password are required" });
@@ -49,6 +52,7 @@ app.post("/api/auth/login", (req, res) => {
   });
 });
 
+// Change your own password. Requires being logged in.
 app.post("/api/auth/change-password", requireAuth(), (req, res) => {
   const { newPassword } = req.body;
   if (!newPassword || newPassword.length < 4) {
@@ -59,6 +63,7 @@ app.post("/api/auth/change-password", requireAuth(), (req, res) => {
   res.json({ ok: true });
 });
 
+// Lab-only: register a new clinic account.
 app.post("/api/auth/register-clinic", requireAuth("lab"), (req, res) => {
   const { clinicName, password } = req.body;
   if (!clinicName || !clinicName.trim()) return res.status(400).json({ error: "clinicName is required" });
@@ -80,16 +85,63 @@ app.post("/api/auth/register-clinic", requireAuth("lab"), (req, res) => {
   res.status(201).json({ ok: true, clinicId: clinic.id });
 });
 
+// ---------- Clinics ----------
+
 app.get("/api/clinics", requireAuth(), (req, res) => {
   const clinics = db.prepare("SELECT id, name FROM clinics ORDER BY name").all();
   res.json(clinics);
 });
 
+// ---------- Orders ----------
+
+// List orders. Lab sees everything; a clinic only sees its own orders.
 app.get("/api/orders", requireAuth(), (req, res) => {
   let rows;
   if (req.user.role === "clinic") {
     rows = db.prepare(`${ORDER_SELECT} WHERE orders.clinic_id = ? ORDER BY due_date ASC`).all(req.user.clinicId);
   } else {
+    rows = db.prepare(`${ORDER_SELECT} ORDER BY due_date ASC`).all();
+  }
+  res.json(rows.map(serializeOrder));
+});
+
+// Create a new order. Only a clinic can do this, and only for itself.
+app.post("/api/orders", requireAuth("clinic"), (req, res) => {
+  const { patient, workType, shade, dueDate } = req.body;
+
+  if (!patient || !patient.trim()) return res.status(400).json({ error: "patient is required" });
+  if (!workType || !workType.trim()) return res.status(400).json({ error: "workType is required" });
+  if (!dueDate) return res.status(400).json({ error: "dueDate is required" });
+
+  const info = db.prepare(`
+    INSERT INTO orders (patient, clinic_id, work_type, shade, due_date, stage_index)
+    VALUES (?, ?, ?, ?, ?, 0)
+  `).run(patient.trim(), req.user.clinicId, workType.trim(), shade || null, dueDate);
+
+  db.prepare("INSERT INTO stage_events (order_id, stage_index) VALUES (?, 0)").run(info.lastInsertRowid);
+
+  const row = db.prepare(`${ORDER_SELECT} WHERE orders.id = ?`).get(info.lastInsertRowid);
+  res.status(201).json(serializeOrder(row));
+});
+
+// Advance an order to the next stage. Only lab staff can do this.
+app.patch("/api/orders/:id/advance", requireAuth("lab"), (req, res) => {
+  const { id } = req.params;
+  const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
+  if (!order) return res.status(404).json({ error: "order not found" });
+
+  if (order.stage_index >= STAGES.length - 1) {
+    return res.status(400).json({ error: "order already at final stage" });
+  }
+
+  const nextStage = order.stage_index + 1;
+  db.prepare("UPDATE orders SET stage_index = ?, updated_at = datetime('now') WHERE id = ?").run(nextStage, id);
+  db.prepare("INSERT INTO stage_events (order_id, stage_index) VALUES (?, ?)").run(id, nextStage);
+
+  const row = db.prepare(`${ORDER_SELECT} WHERE orders.id = ?`).get(id);
+  res.json(serializeOrder(row));
+});
+
 app.get("/api/orders/:id/history", requireAuth(), (req, res) => {
   const { id } = req.params;
   const events = db.prepare("SELECT stage_index, changed_at FROM stage_events WHERE order_id = ? ORDER BY changed_at ASC").all(id);
@@ -100,5 +152,3 @@ const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`Dental lab tracker API running on http://localhost:${PORT}`);
 });
-
-  
