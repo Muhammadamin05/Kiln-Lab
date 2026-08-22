@@ -11,6 +11,13 @@ CREATE TABLE IF NOT EXISTS clinics (
   name TEXT NOT NULL UNIQUE
 );
 
+CREATE TABLE IF NOT EXISTS doctors (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  clinic_id INTEGER NOT NULL REFERENCES clinics(id),
+  name TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS orders (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   patient TEXT NOT NULL,
@@ -40,7 +47,6 @@ CREATE TABLE IF NOT EXISTS users (
 );
 `);
 
-// ---- Migrations: add columns if they don't exist yet (safe to re-run) ----
 function ensureColumn(table, column, definition) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all();
   const exists = cols.some((c) => c.name === column);
@@ -58,6 +64,10 @@ ensureColumn("orders", "modeling_due_date", "TEXT");
 ensureColumn("orders", "ceramist_technician", "TEXT");
 ensureColumn("orders", "ceramist_quantity", "INTEGER");
 ensureColumn("orders", "ceramist_due_date", "TEXT");
+ensureColumn("orders", "tray_info", "TEXT");
+ensureColumn("orders", "fitting_date_1", "TEXT");
+ensureColumn("orders", "fitting_date_2", "TEXT");
+ensureColumn("orders", "fitting_date_3", "TEXT");
 
 const clinicCount = db.prepare("SELECT COUNT(*) AS n FROM clinics").get().n;
 if (clinicCount === 0) {
