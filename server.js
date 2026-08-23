@@ -26,14 +26,24 @@ function serializeOrder(row) {
     stageIndex: row.stage_index,
     stage: STAGES[row.stage_index],
     modeling: {
-      technician: row.modeling_technician,
+      technicianId: row.modeling_technician_id,
+      technicianName: row.modeling_technician_name,
       quantity: row.modeling_quantity,
       dueDate: row.modeling_due_date,
+      price: row.modeling_price,
+      status: row.modeling_status,
+      startedAt: row.modeling_started_at,
+      completedAt: row.modeling_completed_at,
     },
     ceramist: {
-      technician: row.ceramist_technician,
+      technicianId: row.ceramist_technician_id,
+      technicianName: row.ceramist_technician_name,
       quantity: row.ceramist_quantity,
       dueDate: row.ceramist_due_date,
+      price: row.ceramist_price,
+      status: row.ceramist_status,
+      startedAt: row.ceramist_started_at,
+      completedAt: row.ceramist_completed_at,
     },
     createdAt: row.created_at,
     updatedAt: row.updated_at,
@@ -41,9 +51,12 @@ function serializeOrder(row) {
 }
 
 const ORDER_SELECT = `
-  SELECT orders.*, clinics.name AS clinic_name
+  SELECT orders.*, clinics.name AS clinic_name,
+    mt.name AS modeling_technician_name, ct.name AS ceramist_technician_name
   FROM orders
   JOIN clinics ON clinics.id = orders.clinic_id
+  LEFT JOIN users mt ON mt.id = orders.modeling_technician_id
+  LEFT JOIN users ct ON ct.id = orders.ceramist_technician_id
 `;
 
 // ---------- Auth ----------
@@ -99,7 +112,6 @@ app.post("/api/auth/change-password", requireAuth(), (req, res) => {
 
 // ---------- Clinics ----------
 
-// Full clinic list with doctor + order counts. Useful for the lab's management screen.
 app.get("/api/clinics", requireAuth(), (req, res) => {
   const clinics = db.prepare(`
     SELECT clinics.*,
@@ -110,7 +122,6 @@ app.get("/api/clinics", requireAuth(), (req, res) => {
   res.json(clinics.map((c) => ({ id: c.id, name: c.name, doctorCount: c.doctor_count, orderCount: c.order_count })));
 });
 
-// Lab can add a clinic to the roster ahead of it registering its own login.
 app.post("/api/clinics", requireAuth("lab"), (req, res) => {
   const { name } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ error: "name is required" });
@@ -124,7 +135,6 @@ app.post("/api/clinics", requireAuth("lab"), (req, res) => {
 
 // ---------- Doctors ----------
 
-// List doctors. Clinic sees only its own; lab can filter by clinicId or see all.
 app.get("/api/doctors", requireAuth(), (req, res) => {
   let rows;
   if (req.user.role === "clinic") {
@@ -137,7 +147,6 @@ app.get("/api/doctors", requireAuth(), (req, res) => {
   res.json(rows.map((d) => ({ id: d.id, name: d.name, clinicId: d.clinic_id })));
 });
 
-// A clinic adds its own doctor; the lab can add a doctor to any clinic (needs clinicId).
 app.post("/api/doctors", requireAuth(), (req, res) => {
   const { name, clinicId } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ error: "name is required" });
@@ -147,6 +156,27 @@ app.post("/api/doctors", requireAuth(), (req, res) => {
 
   const info = db.prepare("INSERT INTO doctors (clinic_id, name) VALUES (?, ?)").run(targetClinicId, name.trim());
   res.status(201).json({ id: info.lastInsertRowid, name: name.trim(), clinicId: targetClinicId });
+});
+
+// ---------- Technicians (lab manages these accounts) ----------
+
+app.get("/api/technicians", requireAuth(), (req, res) => {
+  const rows = db.prepare("SELECT id, name FROM users WHERE role = 'technician' ORDER BY name").all();
+  res.json(rows);
+});
+
+app.post("/api/technicians", requireAuth("lab"), (req, res) => {
+  const { name, password } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: "name is required" });
+  if (!password || password.length < 4) return res.status(400).json({ error: "пароль должен быть не короче 4 символов" });
+
+  const existing = db.prepare("SELECT id FROM users WHERE name = ?").get(name.trim());
+  if (existing) return res.status(409).json({ error: "аккаунт с таким именем уже есть" });
+
+  const hash = bcrypt.hashSync(password, 10);
+  const info = db.prepare("INSERT INTO users (name, password_hash, role, clinic_id) VALUES (?, ?, 'technician', NULL)")
+    .run(name.trim(), hash);
+  res.status(201).json({ id: info.lastInsertRowid, name: name.trim() });
 });
 
 // ---------- Orders ----------
@@ -176,9 +206,10 @@ app.post("/api/orders", requireAuth("clinic"), (req, res) => {
   const info = db.prepare(`
     INSERT INTO orders (
       patient, clinic_id, doctor, tooth_count, tooth_positions, work_type, shade, due_date,
-      tray_info, fitting_date_1, fitting_date_2, fitting_date_3, stage_index
+      tray_info, fitting_date_1, fitting_date_2, fitting_date_3, stage_index,
+      modeling_status, ceramist_status
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', 'pending')
   `).run(
     patient.trim(),
     req.user.clinicId,
@@ -217,9 +248,10 @@ app.patch("/api/orders/:id/advance", requireAuth("lab"), (req, res) => {
   res.json(serializeOrder(row));
 });
 
+// Lab assigns a technician, quantity, deadline, and price for a task on an order.
 app.patch("/api/orders/:id/assign", requireAuth("lab"), (req, res) => {
   const { id } = req.params;
-  const { taskType, technician, quantity, dueDate } = req.body;
+  const { taskType, technicianId, quantity, dueDate, price } = req.body;
 
   if (!["modeling", "ceramist"].includes(taskType)) {
     return res.status(400).json({ error: "taskType must be 'modeling' or 'ceramist'" });
@@ -228,12 +260,14 @@ app.patch("/api/orders/:id/assign", requireAuth("lab"), (req, res) => {
   const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
   if (!order) return res.status(404).json({ error: "order not found" });
 
-  const prefix = taskType === "modeling" ? "modeling" : "ceramist";
+  const prefix = taskType;
   db.prepare(`
     UPDATE orders
-    SET ${prefix}_technician = ?, ${prefix}_quantity = ?, ${prefix}_due_date = ?, updated_at = datetime('now')
+    SET ${prefix}_technician_id = ?, ${prefix}_quantity = ?, ${prefix}_due_date = ?, ${prefix}_price = ?,
+        ${prefix}_status = 'pending', ${prefix}_started_at = NULL, ${prefix}_completed_at = NULL,
+        updated_at = datetime('now')
     WHERE id = ?
-  `).run(technician || null, quantity || null, dueDate || null, id);
+  `).run(technicianId || null, quantity || null, dueDate || null, price || null, id);
 
   const row = db.prepare(`${ORDER_SELECT} WHERE orders.id = ?`).get(id);
   res.json(serializeOrder(row));
@@ -243,6 +277,94 @@ app.get("/api/orders/:id/history", requireAuth(), (req, res) => {
   const { id } = req.params;
   const events = db.prepare("SELECT stage_index, changed_at FROM stage_events WHERE order_id = ? ORDER BY changed_at ASC").all(id);
   res.json(events.map((e) => ({ stage: STAGES[e.stage_index], changedAt: e.changed_at })));
+});
+
+// ---------- Technician's own task queue ----------
+
+function taskRowToTask(row, taskType) {
+  const prefix = taskType;
+  return {
+    orderId: row.id,
+    taskType,
+    patient: row.patient,
+    clinic: row.clinic_name,
+    workType: row.work_type,
+    quantity: row[`${prefix}_quantity`],
+    dueDate: row[`${prefix}_due_date`],
+    price: row[`${prefix}_price`],
+    status: row[`${prefix}_status`],
+    startedAt: row[`${prefix}_started_at`],
+    completedAt: row[`${prefix}_completed_at`],
+  };
+}
+
+// List tasks (modeling/ceramist) assigned to the logged-in technician.
+app.get("/api/tasks/mine", requireAuth("technician"), (req, res) => {
+  const rows = db.prepare(`
+    SELECT orders.*, clinics.name AS clinic_name FROM orders
+    JOIN clinics ON clinics.id = orders.clinic_id
+    WHERE orders.modeling_technician_id = ? OR orders.ceramist_technician_id = ?
+  `).all(req.user.userId, req.user.userId);
+
+  const tasks = [];
+  rows.forEach((row) => {
+    if (row.modeling_technician_id === req.user.userId) tasks.push(taskRowToTask(row, "modeling"));
+    if (row.ceramist_technician_id === req.user.userId) tasks.push(taskRowToTask(row, "ceramist"));
+  });
+  res.json(tasks);
+});
+
+// Today's stats for the logged-in technician: in-progress count, completed today, earned today.
+app.get("/api/tasks/stats", requireAuth("technician"), (req, res) => {
+  const rows = db.prepare(`
+    SELECT modeling_technician_id, modeling_status, modeling_completed_at, modeling_price,
+           ceramist_technician_id, ceramist_status, ceramist_completed_at, ceramist_price
+    FROM orders
+    WHERE modeling_technician_id = ? OR ceramist_technician_id = ?
+  `).all(req.user.userId, req.user.userId);
+
+  const today = new Date().toISOString().slice(0, 10);
+  let inProgress = 0, completedToday = 0, earnedToday = 0;
+
+  rows.forEach((row) => {
+    if (row.modeling_technician_id === req.user.userId) {
+      if (row.modeling_status === "in_progress") inProgress++;
+      if (row.modeling_status === "done" && (row.modeling_completed_at || "").slice(0, 10) === today) {
+        completedToday++;
+        earnedToday += row.modeling_price || 0;
+      }
+    }
+    if (row.ceramist_technician_id === req.user.userId) {
+      if (row.ceramist_status === "in_progress") inProgress++;
+      if (row.ceramist_status === "done" && (row.ceramist_completed_at || "").slice(0, 10) === today) {
+        completedToday++;
+        earnedToday += row.ceramist_price || 0;
+      }
+    }
+  });
+
+  res.json({ inProgress, completedToday, earnedToday });
+});
+
+// Technician starts or completes their own assigned task.
+app.patch("/api/tasks/:orderId/:taskType/:action", requireAuth("technician"), (req, res) => {
+  const { orderId, taskType, action } = req.params;
+  if (!["modeling", "ceramist"].includes(taskType)) return res.status(400).json({ error: "invalid taskType" });
+  if (!["start", "complete"].includes(action)) return res.status(400).json({ error: "invalid action" });
+
+  const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(orderId);
+  if (!order) return res.status(404).json({ error: "order not found" });
+  if (order[`${taskType}_technician_id`] !== req.user.userId) {
+    return res.status(403).json({ error: "эта задача не назначена на вас" });
+  }
+
+  if (action === "start") {
+    db.prepare(`UPDATE orders SET ${taskType}_status = 'in_progress', ${taskType}_started_at = datetime('now') WHERE id = ?`).run(orderId);
+  } else {
+    db.prepare(`UPDATE orders SET ${taskType}_status = 'done', ${taskType}_completed_at = datetime('now') WHERE id = ?`).run(orderId);
+  }
+
+  res.json({ ok: true });
 });
 
 const PORT = process.env.PORT || 3001;
