@@ -6,6 +6,11 @@ const db = new Database(path.join(__dirname, "tracker.db"));
 db.pragma("journal_mode = WAL");
 
 db.exec(`
+CREATE TABLE IF NOT EXISTS schema_meta (
+  key TEXT PRIMARY KEY,
+  value TEXT
+);
+
 CREATE TABLE IF NOT EXISTS clinics (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL UNIQUE
@@ -41,11 +46,32 @@ CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   password_hash TEXT NOT NULL,
-  role TEXT NOT NULL CHECK (role IN ('lab', 'clinic')),
+  role TEXT NOT NULL,
   clinic_id INTEGER REFERENCES clinics(id),
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 `);
+
+// One-time migration: older deployments created `users.role` with a CHECK
+// constraint limited to ('lab','clinic'). Rebuild the table without that
+// restriction so 'technician' accounts can be inserted too.
+const migrated = db.prepare("SELECT value FROM schema_meta WHERE key = 'users_role_open'").get();
+if (!migrated) {
+  db.exec(`
+    CREATE TABLE users_new (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL,
+      clinic_id INTEGER REFERENCES clinics(id),
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    INSERT INTO users_new SELECT id, name, password_hash, role, clinic_id, created_at FROM users;
+    DROP TABLE users;
+    ALTER TABLE users_new RENAME TO users;
+  `);
+  db.prepare("INSERT INTO schema_meta (key, value) VALUES ('users_role_open', '1')").run();
+}
 
 function ensureColumn(table, column, definition) {
   const cols = db.prepare(`PRAGMA table_info(${table})`).all();
@@ -58,16 +84,20 @@ function ensureColumn(table, column, definition) {
 ensureColumn("orders", "doctor", "TEXT");
 ensureColumn("orders", "tooth_count", "INTEGER");
 ensureColumn("orders", "tooth_positions", "TEXT");
-ensureColumn("orders", "modeling_technician", "TEXT");
-ensureColumn("orders", "modeling_quantity", "INTEGER");
-ensureColumn("orders", "modeling_due_date", "TEXT");
-ensureColumn("orders", "ceramist_technician", "TEXT");
-ensureColumn("orders", "ceramist_quantity", "INTEGER");
-ensureColumn("orders", "ceramist_due_date", "TEXT");
 ensureColumn("orders", "tray_info", "TEXT");
 ensureColumn("orders", "fitting_date_1", "TEXT");
 ensureColumn("orders", "fitting_date_2", "TEXT");
 ensureColumn("orders", "fitting_date_3", "TEXT");
+
+["modeling", "ceramist"].forEach((prefix) => {
+  ensureColumn("orders", `${prefix}_technician_id`, "INTEGER REFERENCES users(id)");
+  ensureColumn("orders", `${prefix}_quantity`, "INTEGER");
+  ensureColumn("orders", `${prefix}_due_date`, "TEXT");
+  ensureColumn("orders", `${prefix}_price`, "REAL");
+  ensureColumn("orders", `${prefix}_status`, "TEXT DEFAULT 'pending'");
+  ensureColumn("orders", `${prefix}_started_at`, "TEXT");
+  ensureColumn("orders", `${prefix}_completed_at`, "TEXT");
+});
 
 const clinicCount = db.prepare("SELECT COUNT(*) AS n FROM clinics").get().n;
 if (clinicCount === 0) {
@@ -90,9 +120,13 @@ if (userCount === 0) {
     insertUser.run(c.name, clinicHash, "clinic", c.id);
   });
 
+  const techHash = bcrypt.hashSync("tech123", 10);
+  insertUser.run("Техник 1", techHash, "technician", null);
+
   console.log("Созданы аккаунты по умолчанию:");
   console.log("  Лаборатория — пароль: lab123");
   clinics.forEach((c) => console.log(`  ${c.name} — пароль: clinic123`));
+  console.log("  Техник 1 — пароль: tech123");
   console.log("Смени эти пароли после первого входа.");
 }
 
