@@ -9,7 +9,22 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
+const TASK_TYPES = ["modeling", "ceramist", "cadcam"];
+
 function serializeOrder(row) {
+  const tasks = {};
+  TASK_TYPES.forEach((t) => {
+    tasks[t] = {
+      technicianId: row[`${t}_technician_id`],
+      technicianName: row[`${t}_technician_name`],
+      quantity: row[`${t}_quantity`],
+      dueDate: row[`${t}_due_date`],
+      price: row[`${t}_price`],
+      status: row[`${t}_status`],
+      startedAt: row[`${t}_started_at`],
+      completedAt: row[`${t}_completed_at`],
+    };
+  });
   return {
     id: row.id,
     patient: row.patient,
@@ -25,26 +40,7 @@ function serializeOrder(row) {
     fittingDates: [row.fitting_date_1, row.fitting_date_2, row.fitting_date_3],
     stageIndex: row.stage_index,
     stage: STAGES[row.stage_index],
-    modeling: {
-      technicianId: row.modeling_technician_id,
-      technicianName: row.modeling_technician_name,
-      quantity: row.modeling_quantity,
-      dueDate: row.modeling_due_date,
-      price: row.modeling_price,
-      status: row.modeling_status,
-      startedAt: row.modeling_started_at,
-      completedAt: row.modeling_completed_at,
-    },
-    ceramist: {
-      technicianId: row.ceramist_technician_id,
-      technicianName: row.ceramist_technician_name,
-      quantity: row.ceramist_quantity,
-      dueDate: row.ceramist_due_date,
-      price: row.ceramist_price,
-      status: row.ceramist_status,
-      startedAt: row.ceramist_started_at,
-      completedAt: row.ceramist_completed_at,
-    },
+    ...tasks,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -52,11 +48,12 @@ function serializeOrder(row) {
 
 const ORDER_SELECT = `
   SELECT orders.*, clinics.name AS clinic_name,
-    mt.name AS modeling_technician_name, ct.name AS ceramist_technician_name
+    mt.name AS modeling_technician_name, ct.name AS ceramist_technician_name, ctc.name AS cadcam_technician_name
   FROM orders
   JOIN clinics ON clinics.id = orders.clinic_id
   LEFT JOIN users mt ON mt.id = orders.modeling_technician_id
   LEFT JOIN users ct ON ct.id = orders.ceramist_technician_id
+  LEFT JOIN users ctc ON ctc.id = orders.cadcam_technician_id
 `;
 
 // ---------- Auth ----------
@@ -179,6 +176,41 @@ app.post("/api/technicians", requireAuth("lab"), (req, res) => {
   res.status(201).json({ id: info.lastInsertRowid, name: name.trim() });
 });
 
+// Remove a technician account. Any tasks assigned to them are unassigned first.
+app.delete("/api/technicians/:id", requireAuth("lab"), (req, res) => {
+  const { id } = req.params;
+  const tech = db.prepare("SELECT id FROM users WHERE id = ? AND role = 'technician'").get(id);
+  if (!tech) return res.status(404).json({ error: "technician not found" });
+
+  TASK_TYPES.forEach((t) => {
+    db.prepare(`
+      UPDATE orders SET ${t}_technician_id = NULL, ${t}_status = 'pending', ${t}_started_at = NULL, ${t}_completed_at = NULL
+      WHERE ${t}_technician_id = ?
+    `).run(id);
+  });
+  db.prepare("DELETE FROM users WHERE id = ?").run(id);
+  res.json({ ok: true });
+});
+
+// ---------- Price list (lab-managed default prices per work type × task type) ----------
+
+app.get("/api/price-list", requireAuth(), (req, res) => {
+  const rows = db.prepare("SELECT * FROM price_list").all();
+  res.json(rows.map((r) => ({ id: r.id, workType: r.work_type, taskType: r.task_type, price: r.price })));
+});
+
+app.post("/api/price-list", requireAuth("lab"), (req, res) => {
+  const { workType, taskType, price } = req.body;
+  if (!workType || !TASK_TYPES.includes(taskType) || price == null) {
+    return res.status(400).json({ error: "workType, taskType, price are required" });
+  }
+  db.prepare(`
+    INSERT INTO price_list (work_type, task_type, price) VALUES (?, ?, ?)
+    ON CONFLICT(work_type, task_type) DO UPDATE SET price = excluded.price
+  `).run(workType, taskType, price);
+  res.json({ ok: true });
+});
+
 // ---------- Orders ----------
 
 app.get("/api/orders", requireAuth(), (req, res) => {
@@ -207,9 +239,9 @@ app.post("/api/orders", requireAuth("clinic"), (req, res) => {
     INSERT INTO orders (
       patient, clinic_id, doctor, tooth_count, tooth_positions, work_type, shade, due_date,
       tray_info, fitting_date_1, fitting_date_2, fitting_date_3, stage_index,
-      modeling_status, ceramist_status
+      modeling_status, ceramist_status, cadcam_status
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', 'pending')
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', 'pending', 'pending')
   `).run(
     patient.trim(),
     req.user.clinicId,
@@ -248,23 +280,21 @@ app.patch("/api/orders/:id/advance", requireAuth("lab"), (req, res) => {
   res.json(serializeOrder(row));
 });
 
-// Lab assigns a technician, quantity, deadline, and price for a task on an order.
 app.patch("/api/orders/:id/assign", requireAuth("lab"), (req, res) => {
   const { id } = req.params;
   const { taskType, technicianId, quantity, dueDate, price } = req.body;
 
-  if (!["modeling", "ceramist"].includes(taskType)) {
-    return res.status(400).json({ error: "taskType must be 'modeling' or 'ceramist'" });
+  if (!TASK_TYPES.includes(taskType)) {
+    return res.status(400).json({ error: "invalid taskType" });
   }
 
   const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(id);
   if (!order) return res.status(404).json({ error: "order not found" });
 
-  const prefix = taskType;
   db.prepare(`
     UPDATE orders
-    SET ${prefix}_technician_id = ?, ${prefix}_quantity = ?, ${prefix}_due_date = ?, ${prefix}_price = ?,
-        ${prefix}_status = 'pending', ${prefix}_started_at = NULL, ${prefix}_completed_at = NULL,
+    SET ${taskType}_technician_id = ?, ${taskType}_quantity = ?, ${taskType}_due_date = ?, ${taskType}_price = ?,
+        ${taskType}_status = 'pending', ${taskType}_started_at = NULL, ${taskType}_completed_at = NULL,
         updated_at = datetime('now')
     WHERE id = ?
   `).run(technicianId || null, quantity || null, dueDate || null, price || null, id);
@@ -282,74 +312,63 @@ app.get("/api/orders/:id/history", requireAuth(), (req, res) => {
 // ---------- Technician's own task queue ----------
 
 function taskRowToTask(row, taskType) {
-  const prefix = taskType;
   return {
     orderId: row.id,
     taskType,
     patient: row.patient,
     clinic: row.clinic_name,
     workType: row.work_type,
-    quantity: row[`${prefix}_quantity`],
-    dueDate: row[`${prefix}_due_date`],
-    price: row[`${prefix}_price`],
-    status: row[`${prefix}_status`],
-    startedAt: row[`${prefix}_started_at`],
-    completedAt: row[`${prefix}_completed_at`],
+    quantity: row[`${taskType}_quantity`],
+    dueDate: row[`${taskType}_due_date`],
+    price: row[`${taskType}_price`],
+    status: row[`${taskType}_status`],
+    startedAt: row[`${taskType}_started_at`],
+    completedAt: row[`${taskType}_completed_at`],
   };
 }
 
-// List tasks (modeling/ceramist) assigned to the logged-in technician.
 app.get("/api/tasks/mine", requireAuth("technician"), (req, res) => {
   const rows = db.prepare(`
     SELECT orders.*, clinics.name AS clinic_name FROM orders
     JOIN clinics ON clinics.id = orders.clinic_id
-    WHERE orders.modeling_technician_id = ? OR orders.ceramist_technician_id = ?
-  `).all(req.user.userId, req.user.userId);
+    WHERE orders.modeling_technician_id = ? OR orders.ceramist_technician_id = ? OR orders.cadcam_technician_id = ?
+  `).all(req.user.userId, req.user.userId, req.user.userId);
 
   const tasks = [];
   rows.forEach((row) => {
-    if (row.modeling_technician_id === req.user.userId) tasks.push(taskRowToTask(row, "modeling"));
-    if (row.ceramist_technician_id === req.user.userId) tasks.push(taskRowToTask(row, "ceramist"));
+    TASK_TYPES.forEach((t) => {
+      if (row[`${t}_technician_id`] === req.user.userId) tasks.push(taskRowToTask(row, t));
+    });
   });
   res.json(tasks);
 });
 
-// Today's stats for the logged-in technician: in-progress count, completed today, earned today.
 app.get("/api/tasks/stats", requireAuth("technician"), (req, res) => {
   const rows = db.prepare(`
-    SELECT modeling_technician_id, modeling_status, modeling_completed_at, modeling_price,
-           ceramist_technician_id, ceramist_status, ceramist_completed_at, ceramist_price
-    FROM orders
-    WHERE modeling_technician_id = ? OR ceramist_technician_id = ?
-  `).all(req.user.userId, req.user.userId);
+    SELECT * FROM orders
+    WHERE modeling_technician_id = ? OR ceramist_technician_id = ? OR cadcam_technician_id = ?
+  `).all(req.user.userId, req.user.userId, req.user.userId);
 
   const today = new Date().toISOString().slice(0, 10);
   let inProgress = 0, completedToday = 0, earnedToday = 0;
 
   rows.forEach((row) => {
-    if (row.modeling_technician_id === req.user.userId) {
-      if (row.modeling_status === "in_progress") inProgress++;
-      if (row.modeling_status === "done" && (row.modeling_completed_at || "").slice(0, 10) === today) {
+    TASK_TYPES.forEach((t) => {
+      if (row[`${t}_technician_id`] !== req.user.userId) return;
+      if (row[`${t}_status`] === "in_progress") inProgress++;
+      if (row[`${t}_status`] === "done" && (row[`${t}_completed_at`] || "").slice(0, 10) === today) {
         completedToday++;
-        earnedToday += row.modeling_price || 0;
+        earnedToday += row[`${t}_price`] || 0;
       }
-    }
-    if (row.ceramist_technician_id === req.user.userId) {
-      if (row.ceramist_status === "in_progress") inProgress++;
-      if (row.ceramist_status === "done" && (row.ceramist_completed_at || "").slice(0, 10) === today) {
-        completedToday++;
-        earnedToday += row.ceramist_price || 0;
-      }
-    }
+    });
   });
 
   res.json({ inProgress, completedToday, earnedToday });
 });
 
-// Technician starts or completes their own assigned task.
 app.patch("/api/tasks/:orderId/:taskType/:action", requireAuth("technician"), (req, res) => {
   const { orderId, taskType, action } = req.params;
-  if (!["modeling", "ceramist"].includes(taskType)) return res.status(400).json({ error: "invalid taskType" });
+  if (!TASK_TYPES.includes(taskType)) return res.status(400).json({ error: "invalid taskType" });
   if (!["start", "complete"].includes(action)) return res.status(400).json({ error: "invalid action" });
 
   const order = db.prepare("SELECT * FROM orders WHERE id = ?").get(orderId);
@@ -365,6 +384,36 @@ app.patch("/api/tasks/:orderId/:taskType/:action", requireAuth("technician"), (r
   }
 
   res.json({ ok: true });
+});
+
+// ---------- Lab-wide statistics ----------
+
+// Per-technician totals: how many tasks completed and how much earned (all-time + today).
+app.get("/api/stats/overview", requireAuth("lab"), (req, res) => {
+  const technicians = db.prepare("SELECT id, name FROM users WHERE role = 'technician' ORDER BY name").all();
+  const rows = db.prepare("SELECT * FROM orders").all();
+  const today = new Date().toISOString().slice(0, 10);
+
+  const result = technicians.map((tech) => {
+    let completedTotal = 0, earnedTotal = 0, completedToday = 0, earnedToday = 0, inProgress = 0;
+    rows.forEach((row) => {
+      TASK_TYPES.forEach((t) => {
+        if (row[`${t}_technician_id`] !== tech.id) return;
+        if (row[`${t}_status`] === "in_progress") inProgress++;
+        if (row[`${t}_status`] === "done") {
+          completedTotal++;
+          earnedTotal += row[`${t}_price`] || 0;
+          if ((row[`${t}_completed_at`] || "").slice(0, 10) === today) {
+            completedToday++;
+            earnedToday += row[`${t}_price`] || 0;
+          }
+        }
+      });
+    });
+    return { id: tech.id, name: tech.name, completedTotal, earnedTotal, completedToday, earnedToday, inProgress };
+  });
+
+  res.json(result);
 });
 
 const PORT = process.env.PORT || 3001;
