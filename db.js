@@ -50,11 +50,18 @@ CREATE TABLE IF NOT EXISTS users (
   clinic_id INTEGER REFERENCES clinics(id),
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS price_list (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  work_type TEXT NOT NULL,
+  task_type TEXT NOT NULL,
+  price REAL NOT NULL,
+  UNIQUE(work_type, task_type)
+);
 `);
 
 // One-time migration: older deployments created `users.role` with a CHECK
-// constraint limited to ('lab','clinic'). Rebuild the table without that
-// restriction so 'technician' accounts can be inserted too.
+// constraint limited to ('lab','clinic'). Rebuild without that restriction.
 const migrated = db.prepare("SELECT value FROM schema_meta WHERE key = 'users_role_open'").get();
 if (!migrated) {
   db.exec(`
@@ -89,7 +96,8 @@ ensureColumn("orders", "fitting_date_1", "TEXT");
 ensureColumn("orders", "fitting_date_2", "TEXT");
 ensureColumn("orders", "fitting_date_3", "TEXT");
 
-["modeling", "ceramist"].forEach((prefix) => {
+// Three parallel task lanes per order: modeling, ceramist, cadcam (CAD/CAM design).
+["modeling", "ceramist", "cadcam"].forEach((prefix) => {
   ensureColumn("orders", `${prefix}_technician_id`, "INTEGER REFERENCES users(id)");
   ensureColumn("orders", `${prefix}_quantity`, "INTEGER");
   ensureColumn("orders", `${prefix}_due_date`, "TEXT");
