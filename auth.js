@@ -4,7 +4,7 @@ const JWT_SECRET = process.env.JWT_SECRET || "kiln-lab-dev-secret-change-me";
 
 function signToken(user) {
   return jwt.sign(
-    { userId: user.id, role: user.role, clinicId: user.clinic_id, name: user.name },
+    { userId: user.id, role: user.role, clinicId: user.clinic_id, name: user.name, isSenior: !!user.is_senior },
     JWT_SECRET,
     { expiresIn: "30d" }
   );
