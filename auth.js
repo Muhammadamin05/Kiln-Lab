@@ -2,12 +2,10 @@ const jwt = require("jsonwebtoken");
 
 const JWT_SECRET = process.env.JWT_SECRET || "kiln-lab-dev-secret-change-me";
 
-function signToken(user) {
-  return jwt.sign(
-    { userId: user.id, role: user.role, clinicId: user.clinic_id, name: user.name, isSenior: !!user.is_senior },
-    JWT_SECRET,
-    { expiresIn: "30d" }
-  );
+// payload.role is 'lab' | 'clinic' | 'technician'.
+// payload.labId identifies the tenant for every role.
+function signToken(payload) {
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: "30d" });
 }
 
 function requireAuth(role) {
@@ -17,11 +15,11 @@ function requireAuth(role) {
     if (!token) return res.status(401).json({ error: "not authenticated" });
 
     try {
-      const payload = jwt.verify(token, JWT_SECRET);
-      if (role && payload.role !== role) {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      if (role && decoded.role !== role) {
         return res.status(403).json({ error: "forbidden" });
       }
-      req.user = payload;
+      req.user = decoded;
       next();
     } catch (err) {
       return res.status(401).json({ error: "invalid or expired token" });
