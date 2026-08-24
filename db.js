@@ -95,6 +95,7 @@ ensureColumn("orders", "tray_info", "TEXT");
 ensureColumn("orders", "fitting_date_1", "TEXT");
 ensureColumn("orders", "fitting_date_2", "TEXT");
 ensureColumn("orders", "fitting_date_3", "TEXT");
+ensureColumn("users", "is_senior", "INTEGER DEFAULT 0");
 
 // Three parallel task lanes per order: modeling, ceramist, cadcam (CAD/CAM design).
 ["modeling", "ceramist", "cadcam"].forEach((prefix) => {
