@@ -94,7 +94,7 @@ app.post("/api/auth/login", (req, res) => {
   if (!valid) return res.status(401).json({ error: "неверное имя или пароль" });
 
   const token = signToken(user);
-  res.json({ token, role: user.role, name: user.name, clinicId: user.clinic_id });
+  res.json({ token, role: user.role, name: user.name, clinicId: user.clinic_id, isSenior: !!user.is_senior });
 });
 
 app.post("/api/auth/change-password", requireAuth(), (req, res) => {
@@ -158,12 +158,12 @@ app.post("/api/doctors", requireAuth(), (req, res) => {
 // ---------- Technicians (lab manages these accounts) ----------
 
 app.get("/api/technicians", requireAuth(), (req, res) => {
-  const rows = db.prepare("SELECT id, name FROM users WHERE role = 'technician' ORDER BY name").all();
-  res.json(rows);
+  const rows = db.prepare("SELECT id, name, is_senior FROM users WHERE role = 'technician' ORDER BY name").all();
+  res.json(rows.map((r) => ({ id: r.id, name: r.name, isSenior: !!r.is_senior })));
 });
 
 app.post("/api/technicians", requireAuth("lab"), (req, res) => {
-  const { name, password } = req.body;
+  const { name, password, isSenior } = req.body;
   if (!name || !name.trim()) return res.status(400).json({ error: "name is required" });
   if (!password || password.length < 4) return res.status(400).json({ error: "пароль должен быть не короче 4 символов" });
 
@@ -171,9 +171,9 @@ app.post("/api/technicians", requireAuth("lab"), (req, res) => {
   if (existing) return res.status(409).json({ error: "аккаунт с таким именем уже есть" });
 
   const hash = bcrypt.hashSync(password, 10);
-  const info = db.prepare("INSERT INTO users (name, password_hash, role, clinic_id) VALUES (?, ?, 'technician', NULL)")
-    .run(name.trim(), hash);
-  res.status(201).json({ id: info.lastInsertRowid, name: name.trim() });
+  const info = db.prepare("INSERT INTO users (name, password_hash, role, clinic_id, is_senior) VALUES (?, ?, 'technician', NULL, ?)")
+    .run(name.trim(), hash, isSenior ? 1 : 0);
+  res.status(201).json({ id: info.lastInsertRowid, name: name.trim(), isSenior: !!isSenior });
 });
 
 // Remove a technician account. Any tasks assigned to them are unassigned first.
@@ -328,6 +328,33 @@ function taskRowToTask(row, taskType) {
 }
 
 app.get("/api/tasks/mine", requireAuth("technician"), (req, res) => {
+  const showAll = req.query.all === "true" && req.user.isSenior;
+
+  if (showAll) {
+    const rows = db.prepare(`
+      SELECT orders.*, clinics.name AS clinic_name,
+        mt.name AS modeling_technician_name, ct.name AS ceramist_technician_name, ctc.name AS cadcam_technician_name
+      FROM orders
+      JOIN clinics ON clinics.id = orders.clinic_id
+      LEFT JOIN users mt ON mt.id = orders.modeling_technician_id
+      LEFT JOIN users ct ON ct.id = orders.ceramist_technician_id
+      LEFT JOIN users ctc ON ctc.id = orders.cadcam_technician_id
+    `).all();
+
+    const tasks = [];
+    rows.forEach((row) => {
+      TASK_TYPES.forEach((t) => {
+        if (!row[`${t}_technician_id`]) return;
+        const task = taskRowToTask(row, t);
+        task.technicianName = row[`${t}_technician_name`];
+        task.mine = row[`${t}_technician_id`] === req.user.userId;
+        if (!task.mine) task.price = null; // hide colleagues' earnings
+        tasks.push(task);
+      });
+    });
+    return res.json(tasks);
+  }
+
   const rows = db.prepare(`
     SELECT orders.*, clinics.name AS clinic_name FROM orders
     JOIN clinics ON clinics.id = orders.clinic_id
@@ -337,7 +364,11 @@ app.get("/api/tasks/mine", requireAuth("technician"), (req, res) => {
   const tasks = [];
   rows.forEach((row) => {
     TASK_TYPES.forEach((t) => {
-      if (row[`${t}_technician_id`] === req.user.userId) tasks.push(taskRowToTask(row, t));
+      if (row[`${t}_technician_id`] === req.user.userId) {
+        const task = taskRowToTask(row, t);
+        task.mine = true;
+        tasks.push(task);
+      }
     });
   });
   res.json(tasks);
@@ -384,6 +415,44 @@ app.patch("/api/tasks/:orderId/:taskType/:action", requireAuth("technician"), (r
   }
 
   res.json({ ok: true });
+});
+
+function csvEscape(value) {
+  if (value === null || value === undefined) return "";
+  const str = String(value);
+  if (/[",\n]/.test(str)) return `"${str.replace(/"/g, '""')}"`;
+  return str;
+}
+
+// Export orders as CSV (opens in Excel). Clinic gets its own orders, lab gets all.
+app.get("/api/orders/export.csv", requireAuth(), (req, res) => {
+  let rows;
+  if (req.user.role === "clinic") {
+    rows = db.prepare(`${ORDER_SELECT} WHERE orders.clinic_id = ? ORDER BY due_date ASC`).all(req.user.clinicId);
+  } else {
+    rows = db.prepare(`${ORDER_SELECT} ORDER BY due_date ASC`).all();
+  }
+
+  const header = [
+    "Пациент", "Клиника", "Врач", "Тип работы", "Оттенок", "Зубы", "Срок сдачи", "Этап",
+    "Моделировка (техник)", "Моделировка (сумма)", "Керамист (техник)", "Керамист (сумма)",
+    "Cad/Cam (техник)", "Cad/Cam (сумма)",
+  ];
+  const lines = [header.map(csvEscape).join(",")];
+
+  rows.forEach((row) => {
+    const o = serializeOrder(row);
+    lines.push([
+      o.patient, o.clinic, o.doctor, o.workType, o.shade, o.toothPositions, o.dueDate, o.stage,
+      o.modeling.technicianName, o.modeling.price, o.ceramist.technicianName, o.ceramist.price,
+      o.cadcam.technicianName, o.cadcam.price,
+    ].map(csvEscape).join(","));
+  });
+
+  const csv = "\uFEFF" + lines.join("\n");
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  res.setHeader("Content-Disposition", "attachment; filename=orders.csv");
+  res.send(csv);
 });
 
 // ---------- Lab-wide statistics ----------
