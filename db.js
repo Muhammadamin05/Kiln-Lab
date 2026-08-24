@@ -5,15 +5,28 @@ const bcrypt = require("bcryptjs");
 const db = new Database(path.join(__dirname, "tracker.db"));
 db.pragma("journal_mode = WAL");
 
+const TRIAL_DAYS = 14;
+
 db.exec(`
 CREATE TABLE IF NOT EXISTS schema_meta (
   key TEXT PRIMARY KEY,
   value TEXT
 );
 
+-- A lab is a tenant: its own isolated space with clinics, technicians, orders.
+CREATE TABLE IF NOT EXISTS labs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  plan TEXT NOT NULL DEFAULT 'trial',
+  trial_ends_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS clinics (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  name TEXT NOT NULL UNIQUE
+  lab_id INTEGER REFERENCES labs(id),
+  name TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS doctors (
@@ -42,28 +55,38 @@ CREATE TABLE IF NOT EXISTS stage_events (
   changed_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Clinic and technician logins. Each belongs to exactly one lab via lab_id.
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL,
   clinic_id INTEGER REFERENCES clinics(id),
+  lab_id INTEGER REFERENCES labs(id),
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE TABLE IF NOT EXISTS price_list (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lab_id INTEGER REFERENCES labs(id),
   work_type TEXT NOT NULL,
   task_type TEXT NOT NULL,
   price REAL NOT NULL,
-  UNIQUE(work_type, task_type)
+  UNIQUE(lab_id, work_type, task_type)
 );
 `);
 
-// One-time migration: older deployments created `users.role` with a CHECK
-// constraint limited to ('lab','clinic'). Rebuild without that restriction.
-const migrated = db.prepare("SELECT value FROM schema_meta WHERE key = 'users_role_open'").get();
-if (!migrated) {
+function ensureColumn(table, column, definition) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  const exists = cols.some((c) => c.name === column);
+  if (!exists) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
+}
+
+// Older deployments had users.role restricted by a CHECK constraint and no lab_id column.
+const rolesMigrated = db.prepare("SELECT value FROM schema_meta WHERE key = 'users_role_open'").get();
+if (!rolesMigrated) {
   db.exec(`
     CREATE TABLE users_new (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,14 +103,6 @@ if (!migrated) {
   db.prepare("INSERT INTO schema_meta (key, value) VALUES ('users_role_open', '1')").run();
 }
 
-function ensureColumn(table, column, definition) {
-  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
-  const exists = cols.some((c) => c.name === column);
-  if (!exists) {
-    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
-  }
-}
-
 ensureColumn("orders", "doctor", "TEXT");
 ensureColumn("orders", "tooth_count", "INTEGER");
 ensureColumn("orders", "tooth_positions", "TEXT");
@@ -95,9 +110,7 @@ ensureColumn("orders", "tray_info", "TEXT");
 ensureColumn("orders", "fitting_date_1", "TEXT");
 ensureColumn("orders", "fitting_date_2", "TEXT");
 ensureColumn("orders", "fitting_date_3", "TEXT");
-ensureColumn("users", "is_senior", "INTEGER DEFAULT 0");
 
-// Three parallel task lanes per order: modeling, ceramist, cadcam (CAD/CAM design).
 ["modeling", "ceramist", "cadcam"].forEach((prefix) => {
   ensureColumn("orders", `${prefix}_technician_id`, "INTEGER REFERENCES users(id)");
   ensureColumn("orders", `${prefix}_quantity`, "INTEGER");
@@ -108,35 +121,61 @@ ensureColumn("users", "is_senior", "INTEGER DEFAULT 0");
   ensureColumn("orders", `${prefix}_completed_at`, "TEXT");
 });
 
-const clinicCount = db.prepare("SELECT COUNT(*) AS n FROM clinics").get().n;
-if (clinicCount === 0) {
-  const insertClinic = db.prepare("INSERT INTO clinics (name) VALUES (?)");
-  ["Дентал+", "Смайл клиник", "Ортодонт-1"].forEach((name) => insertClinic.run(name));
+ensureColumn("users", "is_senior", "INTEGER DEFAULT 0");
+ensureColumn("users", "lab_id", "INTEGER REFERENCES labs(id)");
+ensureColumn("clinics", "lab_id", "INTEGER REFERENCES labs(id)");
+ensureColumn("price_list", "lab_id", "INTEGER REFERENCES labs(id)");
+
+// One-time tenancy migration: turn the original single "Лаборатория" account
+// into a real lab tenant, and attach all existing clinics/technicians/prices to it.
+const tenancyMigrated = db.prepare("SELECT value FROM schema_meta WHERE key = 'tenancy_migrated'").get();
+if (!tenancyMigrated) {
+  const oldLabUser = db.prepare("SELECT * FROM users WHERE role = 'lab'").get();
+  let labId = null;
+
+  if (oldLabUser) {
+    const trialEnds = new Date(Date.now() + TRIAL_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const info = db.prepare(
+      "INSERT INTO labs (name, password_hash, plan, trial_ends_at) VALUES (?, ?, 'paid', NULL)"
+    ).run(oldLabUser.name, oldLabUser.password_hash);
+    labId = info.lastInsertRowid;
+
+    db.prepare("UPDATE clinics SET lab_id = ? WHERE lab_id IS NULL").run(labId);
+    db.prepare("UPDATE users SET lab_id = ? WHERE lab_id IS NULL AND role IN ('clinic','technician')").run(labId);
+    db.prepare("UPDATE price_list SET lab_id = ? WHERE lab_id IS NULL").run(labId);
+  }
+
+  db.prepare("INSERT INTO schema_meta (key, value) VALUES ('tenancy_migrated', '1')").run();
 }
 
-const userCount = db.prepare("SELECT COUNT(*) AS n FROM users").get().n;
-if (userCount === 0) {
-  const insertUser = db.prepare(
-    "INSERT INTO users (name, password_hash, role, clinic_id) VALUES (?, ?, ?, ?)"
-  );
-
+// Seed a demo lab + accounts only if the database is completely empty (fresh install).
+const labCount = db.prepare("SELECT COUNT(*) AS n FROM labs").get().n;
+if (labCount === 0) {
   const labHash = bcrypt.hashSync("lab123", 10);
-  insertUser.run("Лаборатория", labHash, "lab", null);
+  const labInfo = db.prepare(
+    "INSERT INTO labs (name, password_hash, plan, trial_ends_at) VALUES (?, ?, 'trial', ?)"
+  ).run("Лаборатория", labHash, new Date(Date.now() + TRIAL_DAYS * 24 * 60 * 60 * 1000).toISOString());
+  const labId = labInfo.lastInsertRowid;
 
-  const clinics = db.prepare("SELECT id, name FROM clinics").all();
+  const insertClinic = db.prepare("INSERT INTO clinics (lab_id, name) VALUES (?, ?)");
+  const insertUser = db.prepare(
+    "INSERT INTO users (name, password_hash, role, clinic_id, lab_id) VALUES (?, ?, ?, ?, ?)"
+  );
   const clinicHash = bcrypt.hashSync("clinic123", 10);
-  clinics.forEach((c) => {
-    insertUser.run(c.name, clinicHash, "clinic", c.id);
+
+  ["Дентал+", "Смайл клиник", "Ортодонт-1"].forEach((name) => {
+    const c = insertClinic.run(labId, name);
+    insertUser.run(name, clinicHash, "clinic", c.lastInsertRowid, labId);
   });
 
   const techHash = bcrypt.hashSync("tech123", 10);
-  insertUser.run("Техник 1", techHash, "technician", null);
+  insertUser.run("Техник 1", techHash, "technician", null, labId);
 
-  console.log("Созданы аккаунты по умолчанию:");
-  console.log("  Лаборатория — пароль: lab123");
-  clinics.forEach((c) => console.log(`  ${c.name} — пароль: clinic123`));
+  console.log("Созданы демо-аккаунты:");
+  console.log("  Лаборатория 'Лаборатория' — пароль: lab123");
+  console.log("  Клиники — пароль: clinic123");
   console.log("  Техник 1 — пароль: tech123");
-  console.log("Смени эти пароли после первого входа.");
 }
 
 module.exports = db;
+module.exports.TRIAL_DAYS = TRIAL_DAYS;
