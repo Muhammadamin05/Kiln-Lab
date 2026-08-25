@@ -74,6 +74,15 @@ CREATE TABLE IF NOT EXISTS price_list (
   price REAL NOT NULL,
   UNIQUE(lab_id, work_type, task_type)
 );
+
+CREATE TABLE IF NOT EXISTS order_comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER NOT NULL REFERENCES orders(id),
+  author_name TEXT NOT NULL,
+  author_role TEXT NOT NULL,
+  text TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 `);
 
 function ensureColumn(table, column, definition) {
