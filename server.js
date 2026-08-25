@@ -223,10 +223,11 @@ app.get("/api/clinics", requireAuth(), (req, res) => {
   const clinics = db.prepare(`
     SELECT clinics.*,
       (SELECT COUNT(*) FROM doctors WHERE doctors.clinic_id = clinics.id) AS doctor_count,
-      (SELECT COUNT(*) FROM orders WHERE orders.clinic_id = clinics.id) AS order_count
+      (SELECT COUNT(*) FROM orders WHERE orders.clinic_id = clinics.id) AS order_count,
+      (SELECT MAX(created_at) FROM orders WHERE orders.clinic_id = clinics.id) AS last_order_at
     FROM clinics WHERE clinics.lab_id = ? ORDER BY name
   `).all(labId);
-  res.json(clinics.map((c) => ({ id: c.id, name: c.name, doctorCount: c.doctor_count, orderCount: c.order_count })));
+  res.json(clinics.map((c) => ({ id: c.id, name: c.name, doctorCount: c.doctor_count, orderCount: c.order_count, lastOrderAt: c.last_order_at })));
 });
 
 app.post("/api/clinics", requireAuth("lab"), (req, res) => {
@@ -569,6 +570,67 @@ app.patch("/api/tasks/:orderId/:taskType/:action", requireAuth("technician"), (r
   }
 
   res.json({ ok: true });
+});
+
+// ---------- Order comments ----------
+
+function orderBelongsToRequester(order, req) {
+  if (!order) return false;
+  if (req.user.role === "clinic") return order.clinic_id === req.user.clinicId;
+  return order.lab_id === req.user.labId;
+}
+
+app.get("/api/orders/:id/comments", requireAuth(), (req, res) => {
+  const { id } = req.params;
+  const order = db.prepare(`${ORDER_SELECT} WHERE orders.id = ?`).get(id);
+  if (!orderBelongsToRequester(order, req)) return res.status(404).json({ error: "order not found" });
+
+  const rows = db.prepare("SELECT * FROM order_comments WHERE order_id = ? ORDER BY created_at ASC").all(id);
+  res.json(rows.map((r) => ({ id: r.id, authorName: r.author_name, authorRole: r.author_role, text: r.text, createdAt: r.created_at })));
+});
+
+app.post("/api/orders/:id/comments", requireAuth(), (req, res) => {
+  const { id } = req.params;
+  const { text } = req.body;
+  if (!text || !text.trim()) return res.status(400).json({ error: "text is required" });
+
+  const order = db.prepare(`${ORDER_SELECT} WHERE orders.id = ?`).get(id);
+  if (!orderBelongsToRequester(order, req)) return res.status(404).json({ error: "order not found" });
+
+  const info = db.prepare("INSERT INTO order_comments (order_id, author_name, author_role, text) VALUES (?, ?, ?, ?)")
+    .run(id, req.user.name, req.user.role, text.trim());
+  const row = db.prepare("SELECT * FROM order_comments WHERE id = ?").get(info.lastInsertRowid);
+  res.status(201).json({ id: row.id, authorName: row.author_name, authorRole: row.author_role, text: row.text, createdAt: row.created_at });
+});
+
+// ---------- Activity feed (lab-wide) ----------
+
+app.get("/api/activity", requireAuth("lab"), (req, res) => {
+  const stageEvents = db.prepare(`
+    SELECT stage_events.changed_at AS at, orders.patient AS patient, clinics.name AS clinic, stage_events.stage_index AS stage_index
+    FROM stage_events
+    JOIN orders ON orders.id = stage_events.order_id
+    JOIN clinics ON clinics.id = orders.clinic_id
+    WHERE clinics.lab_id = ?
+    ORDER BY stage_events.changed_at DESC LIMIT 20
+  `).all(req.user.labId);
+
+  const comments = db.prepare(`
+    SELECT order_comments.created_at AS at, orders.patient AS patient, clinics.name AS clinic,
+      order_comments.author_name AS author_name, order_comments.text AS text
+    FROM order_comments
+    JOIN orders ON orders.id = order_comments.order_id
+    JOIN clinics ON clinics.id = orders.clinic_id
+    WHERE clinics.lab_id = ?
+    ORDER BY order_comments.created_at DESC LIMIT 20
+  `).all(req.user.labId);
+
+  const events = [
+    ...stageEvents.map((e) => ({ type: "stage", at: e.at, patient: e.patient, clinic: e.clinic, stage: STAGES[e.stage_index] })),
+    ...comments.map((c) => ({ type: "comment", at: c.at, patient: c.patient, clinic: c.clinic, author: c.author_name, text: c.text })),
+  ].sort((a, b) => (a.at < b.at ? 1 : -1)).slice(0, 25);
+
+  res.json(events);
 });
 
 // ---------- Lab-wide statistics ----------
