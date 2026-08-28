@@ -83,6 +83,74 @@ CREATE TABLE IF NOT EXISTS order_comments (
   text TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS clinic_price_book (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lab_id INTEGER REFERENCES labs(id),
+  clinic_id INTEGER REFERENCES clinics(id),
+  work_type TEXT NOT NULL,
+  price REAL NOT NULL,
+  UNIQUE(clinic_id, work_type)
+);
+
+CREATE TABLE IF NOT EXISTS invoices (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER NOT NULL UNIQUE REFERENCES orders(id),
+  lab_id INTEGER REFERENCES labs(id),
+  clinic_id INTEGER REFERENCES clinics(id),
+  amount REAL NOT NULL,
+  status TEXT NOT NULL DEFAULT 'draft',
+  issued_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  invoice_id INTEGER NOT NULL REFERENCES invoices(id),
+  amount REAL NOT NULL,
+  method TEXT NOT NULL DEFAULT 'cash',
+  paid_at TEXT NOT NULL,
+  comment TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS deliveries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  order_id INTEGER NOT NULL REFERENCES orders(id),
+  delivery_type TEXT NOT NULL,
+  address TEXT,
+  window_start TEXT,
+  window_end TEXT,
+  courier_id INTEGER REFERENCES users(id),
+  status TEXT NOT NULL DEFAULT 'unassigned',
+  status_note TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  recipient_role TEXT NOT NULL,
+  recipient_id INTEGER,
+  recipient_clinic_id INTEGER REFERENCES clinics(id),
+  recipient_lab_id INTEGER REFERENCES labs(id),
+  type TEXT NOT NULL,
+  message TEXT NOT NULL,
+  order_id INTEGER REFERENCES orders(id),
+  is_read INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  lab_id INTEGER REFERENCES labs(id),
+  actor_name TEXT,
+  actor_role TEXT,
+  entity_type TEXT NOT NULL,
+  entity_id INTEGER,
+  action TEXT NOT NULL,
+  details TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 `);
 
 function ensureColumn(table, column, definition) {
@@ -134,6 +202,8 @@ ensureColumn("users", "is_senior", "INTEGER DEFAULT 0");
 ensureColumn("users", "lab_id", "INTEGER REFERENCES labs(id)");
 ensureColumn("clinics", "lab_id", "INTEGER REFERENCES labs(id)");
 ensureColumn("price_list", "lab_id", "INTEGER REFERENCES labs(id)");
+ensureColumn("orders", "file_link", "TEXT");
+ensureColumn("orders", "clinic_price_snapshot", "REAL");
 
 // One-time tenancy migration: turn the original single "Лаборатория" account
 // into a real lab tenant, and attach all existing clinics/technicians/prices to it.
