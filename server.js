@@ -14,6 +14,20 @@ const TRIAL_DAYS = db.TRIAL_DAYS || 14;
 const FREE_CLINIC_LIMIT = 2;
 const FREE_TECH_LIMIT = 1;
 
+function logAudit(labId, actor, entityType, entityId, action, details) {
+  db.prepare(`
+    INSERT INTO audit_events (lab_id, actor_name, actor_role, entity_type, entity_id, action, details)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(labId, actor.name, actor.role, entityType, entityId || null, action, details ? JSON.stringify(details) : null);
+}
+
+function notify({ labId, clinicId, role, message, orderId }) {
+  db.prepare(`
+    INSERT INTO notifications (recipient_role, recipient_clinic_id, recipient_lab_id, type, message, order_id)
+    VALUES (?, ?, ?, 'order_event', ?, ?)
+  `).run(role, clinicId || null, labId || null, message, orderId || null);
+}
+
 // ---------- Plan / tenant helpers ----------
 
 function getLab(labId) {
@@ -94,6 +108,8 @@ function serializeOrder(row) {
     dueDate: row.due_date,
     trayInfo: row.tray_info,
     fittingDates: [row.fitting_date_1, row.fitting_date_2, row.fitting_date_3],
+    fileLink: row.file_link,
+    clinicPriceSnapshot: row.clinic_price_snapshot,
     stageIndex: row.stage_index,
     stage: STAGES[row.stage_index],
     ...tasks,
@@ -353,7 +369,7 @@ app.get("/api/orders", requireAuth(), (req, res) => {
 app.post("/api/orders", requireAuth("clinic"), (req, res) => {
   const {
     patient, doctor, toothCount, toothPositions, workType, shade, dueDate,
-    trayInfo, fittingDates,
+    trayInfo, fittingDates, fileLink,
   } = req.body;
 
   if (!patient || !patient.trim()) return res.status(400).json({ error: "patient is required" });
@@ -362,13 +378,19 @@ app.post("/api/orders", requireAuth("clinic"), (req, res) => {
 
   const fd = Array.isArray(fittingDates) ? fittingDates : [];
 
+  // Price snapshot: what THIS clinic pays for this work type, frozen at order time.
+  // Falls back to null (lab fills it in manually) if no clinic price book entry exists yet.
+  const priceRow = db.prepare("SELECT price FROM clinic_price_book WHERE clinic_id = ? AND work_type = ?")
+    .get(req.user.clinicId, workType.trim());
+  const priceSnapshot = priceRow ? priceRow.price : null;
+
   const info = db.prepare(`
     INSERT INTO orders (
       patient, clinic_id, doctor, tooth_count, tooth_positions, work_type, shade, due_date,
       tray_info, fitting_date_1, fitting_date_2, fitting_date_3, stage_index,
-      modeling_status, ceramist_status, cadcam_status
+      modeling_status, ceramist_status, cadcam_status, file_link, clinic_price_snapshot
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', 'pending', 'pending')
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 'pending', 'pending', 'pending', ?, ?)
   `).run(
     patient.trim(),
     req.user.clinicId,
@@ -381,10 +403,16 @@ app.post("/api/orders", requireAuth("clinic"), (req, res) => {
     trayInfo ? trayInfo.trim() : null,
     fd[0] || null,
     fd[1] || null,
-    fd[2] || null
+    fd[2] || null,
+    fileLink ? fileLink.trim() : null,
+    priceSnapshot
   );
 
   db.prepare("INSERT INTO stage_events (order_id, stage_index) VALUES (?, 0)").run(info.lastInsertRowid);
+
+  const clinic = db.prepare("SELECT lab_id FROM clinics WHERE id = ?").get(req.user.clinicId);
+  logAudit(clinic.lab_id, req.user, "order", info.lastInsertRowid, "created", { patient: patient.trim() });
+  notify({ labId: clinic.lab_id, role: "lab", message: `Новый заказ от клиники: ${patient.trim()}`, orderId: info.lastInsertRowid });
 
   const row = db.prepare(`${ORDER_SELECT} WHERE orders.id = ?`).get(info.lastInsertRowid);
   res.status(201).json(serializeOrder(row));
@@ -402,6 +430,10 @@ app.patch("/api/orders/:id/advance", requireAuth("lab"), (req, res) => {
   const nextStage = order.stage_index + 1;
   db.prepare("UPDATE orders SET stage_index = ?, updated_at = datetime('now') WHERE id = ?").run(nextStage, id);
   db.prepare("INSERT INTO stage_events (order_id, stage_index) VALUES (?, ?)").run(id, nextStage);
+  logAudit(req.user.labId, req.user, "order", id, "stage_changed", { stage: STAGES[nextStage] });
+  if (STAGES[nextStage] === "Готово") {
+    notify({ clinicId: order.clinic_id, role: "clinic", message: `Заказ «${order.patient}» готов`, orderId: id });
+  }
 
   const row = db.prepare(`${ORDER_SELECT} WHERE orders.id = ?`).get(id);
   res.json(serializeOrder(row));
@@ -570,6 +602,229 @@ app.patch("/api/tasks/:orderId/:taskType/:action", requireAuth("technician"), (r
   }
 
   res.json({ ok: true });
+});
+
+// ---------- Clinic price book (what clinics pay, separate from technician payouts) ----------
+
+app.get("/api/clinic-price-book/:clinicId", requireAuth(), (req, res) => {
+  const { clinicId } = req.params;
+  const rows = db.prepare("SELECT * FROM clinic_price_book WHERE clinic_id = ?").all(clinicId);
+  res.json(rows.map((r) => ({ id: r.id, workType: r.work_type, price: r.price })));
+});
+
+app.post("/api/clinic-price-book/:clinicId", requireAuth("lab"), (req, res) => {
+  const { clinicId } = req.params;
+  const { workType, price } = req.body;
+  if (!workType || price == null) return res.status(400).json({ error: "workType and price are required" });
+  db.prepare(`
+    INSERT INTO clinic_price_book (lab_id, clinic_id, work_type, price) VALUES (?, ?, ?, ?)
+    ON CONFLICT(clinic_id, work_type) DO UPDATE SET price = excluded.price
+  `).run(req.user.labId, clinicId, workType, price);
+  res.json({ ok: true });
+});
+
+// ---------- Invoices & payments ----------
+
+app.post("/api/orders/:id/invoice", requireAuth("lab"), (req, res) => {
+  const { id } = req.params;
+  const order = db.prepare(`${ORDER_SELECT} WHERE orders.id = ?`).get(id);
+  if (!order || order.lab_id !== req.user.labId) return res.status(404).json({ error: "order not found" });
+
+  const existing = db.prepare("SELECT * FROM invoices WHERE order_id = ?").get(id);
+  if (existing) return res.status(409).json({ error: "счёт по этому заказу уже создан" });
+
+  const amount = order.clinic_price_snapshot || 0;
+  const info = db.prepare(`
+    INSERT INTO invoices (order_id, lab_id, clinic_id, amount, status) VALUES (?, ?, ?, ?, 'draft')
+  `).run(id, req.user.labId, order.clinic_id, amount);
+
+  logAudit(req.user.labId, req.user, "invoice", info.lastInsertRowid, "created", { amount });
+  res.status(201).json({ id: info.lastInsertRowid, orderId: Number(id), amount, status: "draft" });
+});
+
+app.patch("/api/invoices/:id/issue", requireAuth("lab"), (req, res) => {
+  const { id } = req.params;
+  const invoice = db.prepare("SELECT * FROM invoices WHERE id = ? AND lab_id = ?").get(id, req.user.labId);
+  if (!invoice) return res.status(404).json({ error: "invoice not found" });
+
+  db.prepare("UPDATE invoices SET status = 'issued', issued_at = datetime('now') WHERE id = ?").run(id);
+  logAudit(req.user.labId, req.user, "invoice", id, "issued", null);
+  notify({ clinicId: invoice.clinic_id, role: "clinic", message: `Выставлен счёт на ${invoice.amount} ₽`, orderId: invoice.order_id });
+  res.json({ ok: true });
+});
+
+function recomputeInvoiceStatus(invoiceId) {
+  const invoice = db.prepare("SELECT * FROM invoices WHERE id = ?").get(invoiceId);
+  const paid = db.prepare("SELECT COALESCE(SUM(amount),0) AS total FROM payments WHERE invoice_id = ?").get(invoiceId).total;
+  let status = invoice.status === "draft" ? "draft" : "issued";
+  if (paid >= invoice.amount && invoice.amount > 0) status = "paid";
+  else if (paid > 0) status = "partially_paid";
+  db.prepare("UPDATE invoices SET status = ? WHERE id = ?").run(status, invoiceId);
+}
+
+app.post("/api/invoices/:id/payments", requireAuth("lab"), (req, res) => {
+  const { id } = req.params;
+  const { amount, method, paidAt, comment } = req.body;
+  if (!amount || amount <= 0) return res.status(400).json({ error: "amount must be positive" });
+
+  const invoice = db.prepare("SELECT * FROM invoices WHERE id = ? AND lab_id = ?").get(id, req.user.labId);
+  if (!invoice) return res.status(404).json({ error: "invoice not found" });
+
+  db.prepare("INSERT INTO payments (invoice_id, amount, method, paid_at, comment) VALUES (?, ?, ?, ?, ?)")
+    .run(id, amount, method || "cash", paidAt || new Date().toISOString().slice(0, 10), comment || null);
+  recomputeInvoiceStatus(id);
+  logAudit(req.user.labId, req.user, "payment", id, "recorded", { amount, method });
+  notify({ clinicId: invoice.clinic_id, role: "clinic", message: `Зафиксирован платёж: ${amount} ₽`, orderId: invoice.order_id });
+
+  const updated = db.prepare("SELECT * FROM invoices WHERE id = ?").get(id);
+  res.status(201).json({ ok: true, invoiceStatus: updated.status });
+});
+
+app.get("/api/invoices", requireAuth(), (req, res) => {
+  let rows;
+  if (req.user.role === "clinic") {
+    rows = db.prepare(`
+      SELECT invoices.*, orders.patient FROM invoices
+      JOIN orders ON orders.id = invoices.order_id
+      WHERE invoices.clinic_id = ? ORDER BY invoices.created_at DESC
+    `).all(req.user.clinicId);
+  } else {
+    rows = db.prepare(`
+      SELECT invoices.*, orders.patient, clinics.name AS clinic_name FROM invoices
+      JOIN orders ON orders.id = invoices.order_id
+      JOIN clinics ON clinics.id = invoices.clinic_id
+      WHERE invoices.lab_id = ? ORDER BY invoices.created_at DESC
+    `).all(req.user.labId);
+  }
+  res.json(rows.map((r) => ({
+    id: r.id, orderId: r.order_id, patient: r.patient, clinic: r.clinic_name,
+    amount: r.amount, status: r.status, issuedAt: r.issued_at, createdAt: r.created_at,
+  })));
+});
+
+app.get("/api/invoices/:id/payments", requireAuth(), (req, res) => {
+  const rows = db.prepare("SELECT * FROM payments WHERE invoice_id = ? ORDER BY paid_at ASC").all(req.params.id);
+  res.json(rows.map((r) => ({ id: r.id, amount: r.amount, method: r.method, paidAt: r.paid_at, comment: r.comment })));
+});
+
+// ---------- Deliveries & couriers ----------
+
+app.post("/api/orders/:id/delivery", requireAuth("lab"), (req, res) => {
+  const { id } = req.params;
+  const { deliveryType, address, windowStart, windowEnd } = req.body;
+  if (!deliveryType || !address) return res.status(400).json({ error: "deliveryType and address are required" });
+
+  const info = db.prepare(`
+    INSERT INTO deliveries (order_id, delivery_type, address, window_start, window_end, status)
+    VALUES (?, ?, ?, ?, ?, 'unassigned')
+  `).run(id, deliveryType, address, windowStart || null, windowEnd || null);
+  logAudit(req.user.labId, req.user, "delivery", info.lastInsertRowid, "created", { deliveryType });
+  res.status(201).json({ id: info.lastInsertRowid, status: "unassigned" });
+});
+
+app.get("/api/deliveries", requireAuth(), (req, res) => {
+  let rows;
+  if (req.user.role === "courier") {
+    rows = db.prepare(`
+      SELECT deliveries.*, orders.patient, clinics.name AS clinic_name FROM deliveries
+      JOIN orders ON orders.id = deliveries.order_id
+      JOIN clinics ON clinics.id = orders.clinic_id
+      WHERE deliveries.courier_id = ? ORDER BY deliveries.window_start ASC
+    `).all(req.user.userId);
+  } else if (req.user.role === "lab") {
+    rows = db.prepare(`
+      SELECT deliveries.*, orders.patient, clinics.name AS clinic_name, u.name AS courier_name FROM deliveries
+      JOIN orders ON orders.id = deliveries.order_id
+      JOIN clinics ON clinics.id = orders.clinic_id
+      LEFT JOIN users u ON u.id = deliveries.courier_id
+      WHERE clinics.lab_id = ? ORDER BY deliveries.updated_at DESC
+    `).all(req.user.labId);
+  } else {
+    rows = db.prepare(`
+      SELECT deliveries.*, orders.patient FROM deliveries
+      JOIN orders ON orders.id = deliveries.order_id
+      WHERE orders.clinic_id = ? ORDER BY deliveries.updated_at DESC
+    `).all(req.user.clinicId);
+  }
+  res.json(rows.map((r) => ({
+    id: r.id, orderId: r.order_id, patient: r.patient, clinic: r.clinic_name,
+    deliveryType: r.delivery_type, address: r.address, windowStart: r.window_start, windowEnd: r.window_end,
+    courierId: r.courier_id, courierName: r.courier_name, status: r.status, statusNote: r.status_note,
+  })));
+});
+
+app.patch("/api/deliveries/:id/assign", requireAuth("lab"), (req, res) => {
+  const { id } = req.params;
+  const { courierId } = req.body;
+  db.prepare("UPDATE deliveries SET courier_id = ?, status = 'assigned', updated_at = datetime('now') WHERE id = ?").run(courierId, id);
+  logAudit(req.user.labId, req.user, "delivery", id, "assigned", { courierId });
+  res.json({ ok: true });
+});
+
+app.patch("/api/deliveries/:id/status", requireAuth(), (req, res) => {
+  const { id } = req.params;
+  const { status, note } = req.body;
+  const valid = ["en_route", "arrived", "picked_up", "delivered"];
+  if (!valid.includes(status)) return res.status(400).json({ error: "invalid status" });
+
+  if (req.user.role === "courier") {
+    const delivery = db.prepare("SELECT * FROM deliveries WHERE id = ?").get(id);
+    if (!delivery || delivery.courier_id !== req.user.userId) return res.status(403).json({ error: "not your delivery" });
+  }
+
+  db.prepare("UPDATE deliveries SET status = ?, status_note = ?, updated_at = datetime('now') WHERE id = ?").run(status, note || null, id);
+  logAudit(req.user.labId || null, req.user, "delivery", id, "status_changed", { status });
+  res.json({ ok: true });
+});
+
+// ---------- Couriers (lab manages accounts, like technicians) ----------
+
+app.get("/api/couriers", requireAuth("lab"), (req, res) => {
+  const rows = db.prepare("SELECT id, name FROM users WHERE role = 'courier' AND lab_id = ? ORDER BY name").all(req.user.labId);
+  res.json(rows);
+});
+
+app.post("/api/couriers", requireAuth("lab"), (req, res) => {
+  const { name, password } = req.body;
+  if (!name || !name.trim()) return res.status(400).json({ error: "name is required" });
+  if (!password || password.length < 4) return res.status(400).json({ error: "пароль должен быть не короче 4 символов" });
+
+  const existing = db.prepare("SELECT id FROM users WHERE name = ? AND lab_id = ?").get(name.trim(), req.user.labId);
+  if (existing) return res.status(409).json({ error: "аккаунт с таким именем уже есть" });
+
+  const hash = bcrypt.hashSync(password, 10);
+  const info = db.prepare("INSERT INTO users (name, password_hash, role, clinic_id, lab_id) VALUES (?, ?, 'courier', NULL, ?)")
+    .run(name.trim(), hash, req.user.labId);
+  res.status(201).json({ id: info.lastInsertRowid, name: name.trim() });
+});
+
+// ---------- Notifications ----------
+
+app.get("/api/notifications", requireAuth(), (req, res) => {
+  let rows;
+  if (req.user.role === "clinic") {
+    rows = db.prepare("SELECT * FROM notifications WHERE recipient_role = 'clinic' AND recipient_clinic_id = ? ORDER BY created_at DESC LIMIT 30").all(req.user.clinicId);
+  } else if (req.user.role === "lab") {
+    rows = db.prepare("SELECT * FROM notifications WHERE recipient_role = 'lab' AND recipient_lab_id = ? ORDER BY created_at DESC LIMIT 30").all(req.user.labId);
+  } else {
+    rows = [];
+  }
+  res.json(rows.map((r) => ({ id: r.id, message: r.message, orderId: r.order_id, isRead: !!r.is_read, createdAt: r.created_at })));
+});
+
+app.patch("/api/notifications/:id/read", requireAuth(), (req, res) => {
+  db.prepare("UPDATE notifications SET is_read = 1 WHERE id = ?").run(req.params.id);
+  res.json({ ok: true });
+});
+
+// ---------- Audit log ----------
+
+app.get("/api/audit-events", requireAuth("lab"), (req, res) => {
+  const rows = db.prepare("SELECT * FROM audit_events WHERE lab_id = ? ORDER BY created_at DESC LIMIT 100").all(req.user.labId);
+  res.json(rows.map((r) => ({
+    id: r.id, actorName: r.actor_name, actorRole: r.actor_role, entityType: r.entity_type,
+    entityId: r.entity_id, action: r.action, details: r.details ? JSON.parse(r.details) : null, createdAt: r.created_at,
+  })));
 });
 
 // ---------- Order comments ----------
